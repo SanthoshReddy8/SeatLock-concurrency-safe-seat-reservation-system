@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import type { Pool } from 'pg';
 import type { BookingStore, Seat } from './types.js';
 
@@ -23,18 +24,19 @@ export class PostgresBookingStore implements BookingStore {
   }
 
   async createBookings(eventId: number, seatIds: number[], userId: number, email: string, idempotencyKey: string, requestHash: string) {
+    // Every transaction acquires seat uniqueness locks in the same order.
+    const orderedSeatIds = [...new Set(seatIds)].sort((left, right) => left - right);
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query('INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING', [userId, email]);
       const inserted = await client.query(
         `INSERT INTO idempotency_keys (key, user_id, request_hash)
          VALUES ($1, $2, $3) ON CONFLICT (key) DO NOTHING RETURNING key`, [idempotencyKey, userId, requestHash]
       );
       if (inserted.rowCount === 0) {
-        const existing = await client.query('SELECT request_hash, response_body, status_code FROM idempotency_keys WHERE key = $1 FOR UPDATE', [idempotencyKey]);
+        const existing = await client.query('SELECT user_id, request_hash, response_body, status_code FROM idempotency_keys WHERE key = $1 FOR UPDATE', [idempotencyKey]);
         const row = existing.rows[0];
-        if (row.request_hash !== requestHash) {
+        if (row.user_id !== userId || row.request_hash !== requestHash) {
           await client.query('ROLLBACK');
           return { statusCode: 409, body: { error: 'idempotency_key_reused' } };
         }
@@ -44,26 +46,36 @@ export class PostgresBookingStore implements BookingStore {
 
       await client.query('SAVEPOINT booking_insert');
       try {
+        const seats = await client.query('SELECT id FROM seats WHERE event_id = $1 AND id = ANY($2::int[]) ORDER BY id', [eventId, orderedSeatIds]);
+        if (orderedSeatIds.length === 0 || orderedSeatIds.length !== seatIds.length || seats.rowCount !== orderedSeatIds.length) {
+          const body = { error: 'invalid_seats' };
+          await client.query('UPDATE idempotency_keys SET response_body = $2, status_code = 400 WHERE key = $1', [idempotencyKey, JSON.stringify(body)]);
+          await client.query('COMMIT');
+          return { statusCode: 400, body };
+        }
+        await client.query('INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING', [userId, email]);
+        const groupId = crypto.randomUUID();
         const rows = [];
-        for (const seatId of seatIds) {
+        for (const seatId of orderedSeatIds) {
           const result = await client.query(
-            `INSERT INTO bookings (event_id, seat_id, user_id, status)
-             VALUES ($1, $2, $3, 'CONFIRMED') RETURNING id, created_at`, [eventId, seatId, userId]
+            `INSERT INTO bookings (event_id, seat_id, user_id, status, group_id)
+             VALUES ($1, $2, $3, 'CONFIRMED', $4) RETURNING id, created_at`, [eventId, seatId, userId, groupId]
           );
           rows.push(result.rows[0]);
         }
-        await client.query('RELEASE SAVEPOINT booking_insert');
-        const body = { id: rows[0].id, eventId, seatIds, userId, createdAt: rows[0].created_at.toISOString() };
+        const body = { id: rows[0].id, bookingIds: rows.map((row) => row.id), groupId, eventId, seatIds: orderedSeatIds, userId, createdAt: rows[0].created_at.toISOString() };
         await client.query('UPDATE idempotency_keys SET response_body = $2, status_code = 201 WHERE key = $1', [idempotencyKey, JSON.stringify(body)]);
         await client.query('COMMIT');
         return { statusCode: 201, body };
       } catch (error: unknown) {
         await client.query('ROLLBACK TO SAVEPOINT booking_insert');
-        if ((error as { code?: string }).code !== '23505') throw error;
-        const body = { error: 'seat_booked' };
-        await client.query('UPDATE idempotency_keys SET response_body = $2, status_code = 409 WHERE key = $1', [idempotencyKey, JSON.stringify(body)]);
+        const databaseError = error as { code?: string; constraint?: string };
+        if (databaseError.code !== '23505' && databaseError.code !== '23503') throw error;
+        const statusCode = databaseError.code === '23503' ? 400 : 409;
+        const body = { error: databaseError.code === '23503' ? 'invalid_seats' : databaseError.constraint === 'users_email_key' ? 'email_in_use' : 'seat_booked' };
+        await client.query('UPDATE idempotency_keys SET response_body = $2, status_code = $3 WHERE key = $1', [idempotencyKey, JSON.stringify(body), statusCode]);
         await client.query('COMMIT');
-        return { statusCode: 409, body };
+        return { statusCode, body };
       }
     } catch (error) {
       await client.query('ROLLBACK');
@@ -72,7 +84,20 @@ export class PostgresBookingStore implements BookingStore {
   }
 
   async cancelBooking(bookingId: number, userId: number): Promise<boolean> {
-    const result = await this.pool.query(`UPDATE bookings SET status = 'CANCELLED' WHERE id = $1 AND user_id = $2 AND status = 'CONFIRMED'`, [bookingId, userId]);
-    return result.rowCount === 1;
+    // A response represents a whole reservation. Cancelling any row in it must
+    // release every seat in one statement; legacy rows without a group stand alone.
+    const result = await this.pool.query(
+      `WITH target AS (
+         SELECT group_id FROM bookings WHERE id = $1 AND user_id = $2 AND status = 'CONFIRMED'
+       ), locked AS MATERIALIZED (
+         SELECT b.id FROM bookings b
+         WHERE b.user_id = $2 AND b.status = 'CONFIRMED' AND EXISTS (SELECT 1 FROM target)
+           AND (b.id = $1 OR b.group_id = (SELECT group_id FROM target))
+         ORDER BY b.seat_id, b.id FOR UPDATE OF b
+       )
+       UPDATE bookings b SET status = 'CANCELLED'
+       FROM locked WHERE b.id = locked.id`, [bookingId, userId]
+    );
+    return (result.rowCount ?? 0) > 0;
   }
 }

@@ -26,6 +26,25 @@ CREATE TABLE IF NOT EXISTS bookings (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- Additive migration: old reservations keep their existing IDs and can still
+-- be cancelled individually; new multi-seat reservations share a group UUID.
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS group_id UUID;
+CREATE INDEX IF NOT EXISTS bookings_group_id_idx ON bookings (group_id);
+
+-- Protect event membership even if an insert bypasses the HTTP API. NOT VALID
+-- preserves legacy rows while enforcing the constraint for every new write.
+CREATE UNIQUE INDEX IF NOT EXISTS seats_id_event_id_unique ON seats (id, event_id);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'bookings_seat_event_fk' AND conrelid = 'bookings'::regclass
+  ) THEN
+    ALTER TABLE bookings ADD CONSTRAINT bookings_seat_event_fk
+      FOREIGN KEY (seat_id, event_id) REFERENCES seats (id, event_id) NOT VALID;
+  END IF;
+END $$;
+
 -- The safety net: one active booking per seat, enforced by the DB
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_booking_per_seat
   ON bookings (seat_id) WHERE status = 'CONFIRMED';

@@ -17,6 +17,8 @@ export type Hold = {
 
 export type Booking = {
   id: number;
+  bookingIds: number[];
+  groupId: string;
   eventId: number;
   seatIds: number[];
   userId: number;
