@@ -2,15 +2,20 @@
   "name": "seat-booking-engine",
   "private": true,
   "type": "module",
+  "engines": { "node": ">=22" },
   "scripts": {
     "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
     "dev:api": "tsx watch src/server.ts",
     "dev:web": "npm --prefix web run dev",
-    "build": "tsc -p tsconfig.json && npm --prefix web run build",
+    "build": "npm run build:api && npm --prefix web run build",
+    "build:api": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
     "start": "node dist/src/server.js",
     "test": "jest --runInBand",
+    "test:integration": "jest --config jest.integration.config.cjs --runInBand",
+    "test:infra": "docker compose -f docker-compose.test.yml up -d --wait",
     "db:migrate": "tsx scripts/migrate.ts",
-    "worker": "tsx src/worker.ts"
+    "worker": "tsx src/worker.ts",
+    "load:test": "k6 run load/k6.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

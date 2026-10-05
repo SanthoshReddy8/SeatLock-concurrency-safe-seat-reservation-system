@@ -6,23 +6,51 @@ services:
       POSTGRES_PASSWORD: booking
       POSTGRES_DB: booking
     ports:
-      - "15432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U booking -d booking"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
   redis:
     image: redis:7-alpine
     ports:
-      - "16379:6379"
+      - "127.0.0.1:16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build: .
+    command: ["node", "dist/scripts/migrate.js"]
+    environment:
+      DATABASE_URL: postgres://booking:booking@postgres:5432/booking
+    depends_on:
+      postgres:
+        condition: service_healthy
   api:
     build: .
     environment:
-      PORT: 3000
+      PORT: 3001
       DATABASE_URL: postgres://booking:booking@postgres:5432/booking
       REDIS_URL: redis://redis:6379
+      HOLD_TTL_SECONDS: ${HOLD_TTL_SECONDS:-300}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-120}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3001:3001"
     depends_on:
-      - postgres
-      - redis
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3001/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 volumes:
   postgres_data:
